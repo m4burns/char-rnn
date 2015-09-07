@@ -1,3 +1,7 @@
+-- require 'nngraph'
+
+-- nngraph.setDebug(true)
+-- nngraph.annotateNodes()
 
 local LSTM = {}
 function LSTM.lstm(input_size, rnn_size, n, dropout)
@@ -19,7 +23,8 @@ function LSTM.lstm(input_size, rnn_size, n, dropout)
     local prev_c = inputs[L*2]
     -- the input to this layer
     if L == 1 then 
-      x = OneHot(input_size)(inputs[1])
+      --x = OneHot(input_size)(inputs[1])
+      x = inputs[1]
       input_size_L = input_size
     else 
       x = outputs[(L-1)*2] 
@@ -55,8 +60,9 @@ function LSTM.lstm(input_size, rnn_size, n, dropout)
   local top_h = outputs[#outputs]
   if dropout > 0 then top_h = nn.Dropout(dropout)(top_h) end
   local proj = nn.Linear(rnn_size, input_size)(top_h)
-  local logsoft = nn.LogSoftMax()(proj)
-  table.insert(outputs, logsoft)
+  -- local logsoft = nn.LogSoftMax()(proj)
+  -- table.insert(outputs, logsoft)
+  table.insert(outputs, nn.Tanh()(proj))
 
   return nn.gModule(inputs, outputs)
 end

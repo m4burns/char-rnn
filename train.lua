@@ -21,19 +21,15 @@ require 'lfs'
 
 require 'util.OneHot'
 require 'util.misc'
-local CharSplitLMMinibatchLoader = require 'util.CharSplitLMMinibatchLoader'
+local NoteMinibatchLoader = require 'util.NoteMinibatchLoader'
 local model_utils = require 'util.model_utils'
 local LSTM = require 'model.LSTM'
 local GRU = require 'model.GRU'
 local RNN = require 'model.RNN'
 
 cmd = torch.CmdLine()
-cmd:text()
-cmd:text('Train a character-level language model')
-cmd:text()
-cmd:text('Options')
 -- data
-cmd:option('-data_dir','data/tinyshakespeare','data directory. Should contain the file input.txt with input data')
+cmd:option('-data_dir','data/song','data directory')
 -- model params
 cmd:option('-rnn_size', 128, 'size of LSTM internal state')
 cmd:option('-num_layers', 2, 'number of layers in the LSTM')
@@ -45,7 +41,7 @@ cmd:option('-learning_rate_decay_after',10,'in number of epochs, when to start d
 cmd:option('-decay_rate',0.95,'decay rate for rmsprop')
 cmd:option('-dropout',0,'dropout for regularization, used after each RNN hidden layer. 0 = no dropout')
 cmd:option('-seq_length',50,'number of timesteps to unroll for')
-cmd:option('-batch_size',50,'number of sequences to train on in parallel')
+cmd:option('-batch_size',1,'number of sequences to train on in parallel') -- was 50
 cmd:option('-max_epochs',50,'number of full passes through the training data')
 cmd:option('-grad_clip',5,'clip gradients at this value')
 cmd:option('-train_frac',0.95,'fraction of data that goes into train set')
@@ -107,10 +103,7 @@ if opt.gpuid >= 0 and opt.opencl == 1 then
 end
 
 -- create the data loader class
-local loader = CharSplitLMMinibatchLoader.create(opt.data_dir, opt.batch_size, opt.seq_length, split_sizes)
-local vocab_size = loader.vocab_size  -- the number of distinct characters
-local vocab = loader.vocab_mapping
-print('vocab size: ' .. vocab_size)
+local loader = NoteMinibatchLoader.create(opt.data_dir, opt.batch_size, opt.seq_length, split_sizes)
 -- make sure output directory exists
 if not path.exists(opt.checkpoint_dir) then lfs.mkdir(opt.checkpoint_dir) end
 
@@ -120,14 +113,6 @@ if string.len(opt.init_from) > 0 then
     print('loading an LSTM from checkpoint ' .. opt.init_from)
     local checkpoint = torch.load(opt.init_from)
     protos = checkpoint.protos
-    -- make sure the vocabs are the same
-    local vocab_compatible = true
-    for c,i in pairs(checkpoint.vocab) do 
-        if not vocab[c] == i then 
-            vocab_compatible = false
-        end
-    end
-    assert(vocab_compatible, 'error, the character vocabulary for this dataset and the one in the saved checkpoint are not the same. This is trouble.')
     -- overwrite model settings based on checkpoint to ensure compatibility
     print('overwriting rnn_size=' .. checkpoint.opt.rnn_size .. ', num_layers=' .. checkpoint.opt.num_layers .. ' based on the checkpoint.')
     opt.rnn_size = checkpoint.opt.rnn_size
@@ -137,13 +122,15 @@ else
     print('creating an ' .. opt.model .. ' with ' .. opt.num_layers .. ' layers')
     protos = {}
     if opt.model == 'lstm' then
-        protos.rnn = LSTM.lstm(vocab_size, opt.rnn_size, opt.num_layers, opt.dropout)
+        protos.rnn = LSTM.lstm(20, opt.rnn_size, opt.num_layers, opt.dropout)
+    --[[
     elseif opt.model == 'gru' then
         protos.rnn = GRU.gru(vocab_size, opt.rnn_size, opt.num_layers, opt.dropout)
     elseif opt.model == 'rnn' then
         protos.rnn = RNN.rnn(vocab_size, opt.rnn_size, opt.num_layers, opt.dropout)
+    --]]
     end
-    protos.criterion = nn.ClassNLLCriterion()
+    protos.criterion = nn.MSECriterion()
 end
 
 -- the initial state of the cell/hidden states
@@ -171,7 +158,7 @@ params, grad_params = model_utils.combine_all_parameters(protos.rnn)
 
 -- initialization
 if do_random_init then
-params:uniform(-0.08, 0.08) -- small numbers uniform
+params:uniform(-0.20, 0.20) -- small numbers uniform
 end
 
 print('number of parameters in the model: ' .. params:nElement())
@@ -190,37 +177,78 @@ function eval_split(split_index, max_batches)
 
     loader:reset_batch_pointer(split_index) -- move batch iteration pointer for this split to front
     local loss = 0
-    local rnn_state = {[0] = init_state}
-    
+    local rnn_state_ctx = {[0] = init_state}
+    local rnn_state_add = {[0] = init_state}
+
     for i = 1,n do -- iterate over batches in the split
         -- fetch a batch
-        local x, y = loader:next_batch(split_index)
+        local x = loader:next_batch(split_index)
+
+        local label = x.label
+        local context = x.context:double()
+        local addition = x.addition:double()
+
         if opt.gpuid >= 0 and opt.opencl == 0 then -- ship the input arrays to GPU
             -- have to convert to float because integers can't be cuda()'d
-            x = x:float():cuda()
-            y = y:float():cuda()
+            context = context:cuda()
+            addition = addition:cuda()
         end
         if opt.gpuid >= 0 and opt.opencl == 1 then -- ship the input arrays to GPU
-            x = x:cl()
-            y = y:cl()
+            context = context:cl()
+            addition = addition:cl()
         end
+
         -- forward pass
         for t=1,opt.seq_length do
             clones.rnn[t]:evaluate() -- for dropout proper functioning
-            local lst = clones.rnn[t]:forward{x[{{}, t}], unpack(rnn_state[t-1])}
-            rnn_state[t] = {}
-            for i=1,#init_state do table.insert(rnn_state[t], lst[i]) end
-            prediction = lst[#lst] 
-            loss = loss + clones.criterion[t]:forward(prediction, y[{{}, t}])
+
+            -- on context
+            local lst = clones.rnn[t]:forward{context[t]:resize(1,20), unpack(rnn_state_ctx[t-1])}
+            rnn_state_ctx[t] = {}
+            for i=1,#init_state do table.insert(rnn_state_ctx[t], lst[i]) end
+
+            local prediction_ctx = lst[#lst]:clone()
+
+            -- on addition
+            lst = clones.rnn[t]:forward{addition[t]:resize(1,20), unpack(rnn_state_add[t-1])}
+            rnn_state_add[t] = {}
+            for i=1,#init_state do table.insert(rnn_state_add[t], lst[i]) end
+
+            local prediction_add = lst[#lst]:clone()
+
+            if label == "good" then
+              loss = loss + clones.criterion[t]:forward(prediction_ctx, prediction_add)
+            else
+              -- XXX pick a more reasoned loss function
+              -- loss = loss + 1 / clones.criterion[t]:forward(prediction_ctx, prediction_add)
+              -- loss = loss + clones.criterion[t]:forward(prediction_ctx, prediction_add)
+            end
         end
         -- carry over lstm state
-        rnn_state[0] = rnn_state[#rnn_state]
+        rnn_state_add[0] = rnn_state_add[#rnn_state_add]
+        rnn_state_ctx[0] = rnn_state_ctx[#rnn_state_ctx]
         print(i .. '/' .. n .. '...')
     end
 
     loss = loss / opt.seq_length / n
     return loss
 end
+
+function make_bad_dir(ctx, add)
+  local add_to_ctx = ctx:clone():add(add, -1)
+  local len = add_to_ctx:norm()
+  --if len == 0 then
+    return torch.rand(1,20)
+  --end
+  --else
+  --  return add:clone():add(add_to_ctx, -1 / len)
+  --end
+end
+
+-- local foo = torch.rand(1,20)
+
+local last_label = ""
+local last_distance = 0
 
 -- do fwd/bwd and return loss, grad_params
 local init_state_global = clone_list(init_state)
@@ -231,37 +259,78 @@ function feval(x)
     grad_params:zero()
 
     ------------------ get minibatch -------------------
-    local x, y = loader:next_batch(1)
+    local x = loader:next_batch(1)
+    local context = x.context:double()
+    local addition = x.addition:double()
+    local label = x.label
+
+    last_label = label
+
     if opt.gpuid >= 0 and opt.opencl == 0 then -- ship the input arrays to GPU
         -- have to convert to float because integers can't be cuda()'d
-        x = x:float():cuda()
-        y = y:float():cuda()
+        context = context:cuda()
+        addition = addition:cuda()
     end
     if opt.gpuid >= 0 and opt.opencl == 1 then -- ship the input arrays to GPU
-        x = x:cl()
-        y = y:cl()
+        context = context:cl()
+        addition = addition:cl()
     end
-    ------------------- forward pass -------------------
-    local rnn_state = {[0] = init_state_global}
-    local predictions = {}           -- softmax outputs
+    ------------------- forward pass on context and addition -------------------
+    local rnn_state_ctx = {[0] = init_state_global}
+    local rnn_state_add = {[0] = init_state_global}
+    local predictions_ctx = {}           -- softmax outputs
+    local predictions_add = {}           -- softmax outputs
     local loss = 0
+    local total_dist = 0
+    local bad_dirs = {}
+
     for t=1,opt.seq_length do
-        clones.rnn[t]:training() -- make sure we are in correct mode (this is cheap, sets flag)
-        local lst = clones.rnn[t]:forward{x[{{}, t}], unpack(rnn_state[t-1])}
-        rnn_state[t] = {}
-        for i=1,#init_state do table.insert(rnn_state[t], lst[i]) end -- extract the state, without output
-        predictions[t] = lst[#lst] -- last element is the prediction
-        loss = loss + clones.criterion[t]:forward(predictions[t], y[{{}, t}])
+        clones.rnn[t]:evaluate() -- make sure we are in correct mode (this is cheap, sets flag)
+
+        context_tr = context[t]:resize(1,20)
+        local lst = clones.rnn[t]:forward{context_tr, unpack(rnn_state_ctx[t-1])}
+        rnn_state_ctx[t] = {}
+        for i=1,#init_state do table.insert(rnn_state_ctx[t], lst[i]) end -- extract the state, without output
+        predictions_ctx[t] = lst[#lst]:clone() -- last element is the prediction
+    end
+
+    grad_params:zero()
+
+    for t=1,opt.seq_length do
+        clones.rnn[t]:training()
+
+        addition_tr = addition[t]:resize(1,20)
+        local lst = clones.rnn[t]:forward{addition_tr, unpack(rnn_state_add[t-1])}
+        rnn_state_add[t] = {}
+        for i=1,#init_state do table.insert(rnn_state_add[t], lst[i]) end -- extract the state, without output
+        predictions_add[t] = lst[#lst]:clone() -- last element is the prediction
+
+        if label == "good" then
+          local dist = clones.criterion[t]:forward(predictions_add[t], predictions_ctx[t])
+          loss = loss + dist
+        else
+          bad_dirs[t] = make_bad_dir(predictions_ctx[t], predictions_add[t])
+          loss = loss + clones.criterion[t]:forward(predictions_add[t], bad_dirs[t])
+        end
+
+        total_dist = total_dist + torch.dist(predictions_ctx[t], predictions_add[t])
     end
     loss = loss / opt.seq_length
-    ------------------ backward pass -------------------
+    last_distance = total_dist / opt.seq_length
+
+    ------------------ backward pass on addition -------------------
     -- initialize gradient at time t to be zeros (there's no influence from future)
     local drnn_state = {[opt.seq_length] = clone_list(init_state, true)} -- true also zeros the clones
     for t=opt.seq_length,1,-1 do
         -- backprop through loss, and softmax/linear
-        local doutput_t = clones.criterion[t]:backward(predictions[t], y[{{}, t}])
+        local doutput_t
+        if label == "good" then
+          doutput_t = clones.criterion[t]:backward(predictions_add[t], predictions_ctx[t])
+        else
+          doutput_t = clones.criterion[t]:backward(predictions_add[t], bad_dirs[t])
+        end
         table.insert(drnn_state[t], doutput_t)
-        local dlst = clones.rnn[t]:backward({x[{{}, t}], unpack(rnn_state[t-1])}, drnn_state[t])
+        local dlst = clones.rnn[t]:backward({addition[t]:resize(1,20), unpack(rnn_state_add[t-1])}, drnn_state[t])
         drnn_state[t-1] = {}
         for k,v in pairs(dlst) do
             if k > 1 then -- k == 1 is gradient on x, which we dont need
@@ -271,9 +340,10 @@ function feval(x)
             end
         end
     end
+
     ------------------------ misc ----------------------
     -- transfer final state to initial state (BPTT)
-    init_state_global = rnn_state[#rnn_state] -- NOTE: I don't think this needs to be a clone, right?
+    init_state_global = rnn_state_add[#rnn_state_add] -- NOTE: I don't think this needs to be a clone, right?
     -- clip gradient element-wise
     grad_params:clamp(-opt.grad_clip, opt.grad_clip)
     return loss, grad_params
@@ -326,7 +396,7 @@ for i = 1, iterations do
     end
 
     if i % opt.print_every == 0 then
-        print(string.format("%d/%d (epoch %.3f), train_loss = %6.8f, grad/param norm = %6.4e, time/batch = %.2fs", i, iterations, epoch, train_loss, grad_params:norm() / params:norm(), time))
+        print(string.format("%d/%d (epoch %.3f), train_loss = %6.8f, label = %s, distance = %6.8f, grad/param norm = %6.4e, time/batch = %.2fs", i, iterations, epoch, train_loss, last_label, last_distance, grad_params:norm() / params:norm(), time))
     end
    
     if i % 10 == 0 then collectgarbage() end
@@ -336,11 +406,11 @@ for i = 1, iterations do
         print('loss is NaN.  This usually indicates a bug.  Please check the issues page for existing issues, or create a new issue, if none exist.  Ideally, please state: your operating system, 32-bit/64-bit, your blas version, cpu/cuda/cl?')
         break -- halt
     end
-    if loss0 == nil then loss0 = loss[1] end
+    --[[if loss0 == nil then loss0 = loss[1] end
     if loss[1] > loss0 * 3 then
         print('loss is exploding, aborting.')
         break -- halt
-    end
+    end]]--
 end
 
 
