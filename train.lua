@@ -18,6 +18,7 @@ require 'nn'
 require 'nngraph'
 require 'optim'
 require 'lfs'
+require 'gnuplot'
 
 require 'util.OneHot'
 require 'util.misc'
@@ -27,12 +28,16 @@ local LSTM = require 'model.LSTM'
 local GRU = require 'model.GRU'
 local RNN = require 'model.RNN'
 
+gnuplot.setterm('x11')
+gnuplot.figure()
+gnuplot.axis({0.3,0.6,0.3,0.6})
+
 cmd = torch.CmdLine()
 -- data
 cmd:option('-data_dir','data/song','data directory')
 -- model params
 cmd:option('-rnn_size', 128, 'size of LSTM internal state')
-cmd:option('-num_layers', 2, 'number of layers in the LSTM')
+cmd:option('-num_layers', 1, 'number of layers in the LSTM')
 cmd:option('-model', 'lstm', 'lstm,gru or rnn')
 -- optimization
 cmd:option('-learning_rate',2e-3,'learning rate')
@@ -122,7 +127,7 @@ else
     print('creating an ' .. opt.model .. ' with ' .. opt.num_layers .. ' layers')
     protos = {}
     if opt.model == 'lstm' then
-        protos.rnn = LSTM.lstm(20, opt.rnn_size, opt.num_layers, opt.dropout)
+        protos.rnn = LSTM.lstm(2, opt.rnn_size, opt.num_layers, opt.dropout)
     --[[
     elseif opt.model == 'gru' then
         protos.rnn = GRU.gru(vocab_size, opt.rnn_size, opt.num_layers, opt.dropout)
@@ -203,14 +208,14 @@ function eval_split(split_index, max_batches)
             clones.rnn[t]:evaluate() -- for dropout proper functioning
 
             -- on context
-            local lst = clones.rnn[t]:forward{context[t]:resize(1,20), unpack(rnn_state_ctx[t-1])}
+            local lst = clones.rnn[t]:forward{context[t]:resize(1,2), unpack(rnn_state_ctx[t-1])}
             rnn_state_ctx[t] = {}
             for i=1,#init_state do table.insert(rnn_state_ctx[t], lst[i]) end
 
             local prediction_ctx = lst[#lst]:clone()
 
             -- on addition
-            lst = clones.rnn[t]:forward{addition[t]:resize(1,20), unpack(rnn_state_add[t-1])}
+            lst = clones.rnn[t]:forward{addition[t]:resize(1,2), unpack(rnn_state_add[t-1])}
             rnn_state_add[t] = {}
             for i=1,#init_state do table.insert(rnn_state_add[t], lst[i]) end
 
@@ -238,7 +243,7 @@ function make_bad_dir(ctx, add)
   local add_to_ctx = ctx:clone():add(add, -1)
   local len = add_to_ctx:norm()
   --if len == 0 then
-    return torch.rand(1,20)
+    return torch.rand(1,2)
   --end
   --else
   --  return add:clone():add(add_to_ctx, -1 / len)
@@ -249,6 +254,10 @@ end
 
 local last_label = ""
 local last_distance = 0
+
+local pv_add = torch.Tensor(100,2)
+local pv_ctx = torch.Tensor(100,2)
+local pv_ctr = 1
 
 -- do fwd/bwd and return loss, grad_params
 local init_state_global = clone_list(init_state)
@@ -287,7 +296,7 @@ function feval(x)
     for t=1,opt.seq_length do
         clones.rnn[t]:evaluate() -- make sure we are in correct mode (this is cheap, sets flag)
 
-        context_tr = context[t]:resize(1,20)
+        context_tr = context[t]:resize(1,2)
         local lst = clones.rnn[t]:forward{context_tr, unpack(rnn_state_ctx[t-1])}
         rnn_state_ctx[t] = {}
         for i=1,#init_state do table.insert(rnn_state_ctx[t], lst[i]) end -- extract the state, without output
@@ -299,7 +308,7 @@ function feval(x)
     for t=1,opt.seq_length do
         clones.rnn[t]:training()
 
-        addition_tr = addition[t]:resize(1,20)
+        addition_tr = addition[t]:resize(1,2)
         local lst = clones.rnn[t]:forward{addition_tr, unpack(rnn_state_add[t-1])}
         rnn_state_add[t] = {}
         for i=1,#init_state do table.insert(rnn_state_add[t], lst[i]) end -- extract the state, without output
@@ -318,6 +327,16 @@ function feval(x)
     loss = loss / opt.seq_length
     last_distance = total_dist / opt.seq_length
 
+    pv_add[pv_ctr] = predictions_add[opt.seq_length]
+    pv_ctx[pv_ctr] = predictions_ctx[opt.seq_length]
+    pv_ctr = pv_ctr + 1
+    if pv_ctr > 100 then
+      pv_ctr = 1
+    end
+
+    gnuplot.plot({'Addition',pv_add,'+'}, {'Context',pv_ctx,'+'})
+    --gnuplot.plotflush()
+
     ------------------ backward pass on addition -------------------
     -- initialize gradient at time t to be zeros (there's no influence from future)
     local drnn_state = {[opt.seq_length] = clone_list(init_state, true)} -- true also zeros the clones
@@ -330,7 +349,7 @@ function feval(x)
           doutput_t = clones.criterion[t]:backward(predictions_add[t], bad_dirs[t])
         end
         table.insert(drnn_state[t], doutput_t)
-        local dlst = clones.rnn[t]:backward({addition[t]:resize(1,20), unpack(rnn_state_add[t-1])}, drnn_state[t])
+        local dlst = clones.rnn[t]:backward({addition[t]:resize(1,2), unpack(rnn_state_add[t-1])}, drnn_state[t])
         drnn_state[t-1] = {}
         for k,v in pairs(dlst) do
             if k > 1 then -- k == 1 is gradient on x, which we dont need
